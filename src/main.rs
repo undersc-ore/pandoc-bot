@@ -50,10 +50,16 @@ async fn main() -> Result<()> {
 
     let bot = Bot::from_env();
 
-    let dialog_storage: MyStorage = SqliteStorage::open("./dialogue.sqlite3", Json)
-        .await
-        .context("Failed to open SqliteStorage")?
-        .erase();
+    let storage: MyStorage = SqliteStorage::open(
+        path_for_persistent_state()
+            .join("dialogue.sqlite3")
+            .to_str()
+            .context("Failed to convert state path to str")?,
+        Json,
+    )
+    .await
+    .context("Failed to open SqliteStorage")?
+    .erase();
 
     Dispatcher::builder(
         bot,
@@ -81,7 +87,7 @@ async fn main() -> Result<()> {
                     ),
             ),
     )
-    .dependencies(dptree::deps![dialog_storage])
+    .dependencies(dptree::deps![storage])
     .build()
     .setup_ctrlc_handler()
     .dispatch()
@@ -316,4 +322,12 @@ fn path_for_input_file<S: AsRef<str>>(file_id: S) -> PathBuf {
         .unwrap_or(PathBuf::from("inputs"));
     path.push(file_id.as_ref());
     path
+}
+
+fn path_for_persistent_state() -> PathBuf {
+    if let Ok(path) = env::var("STATE_PATH") {
+        PathBuf::from(path)
+    } else {
+        PathBuf::from("./")
+    }
 }
