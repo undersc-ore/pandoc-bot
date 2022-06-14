@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
+use log::info;
 use serde::{Deserialize, Serialize};
 use teloxide::{
     dispatching::dialogue::{
-        serializer::Json, ErasedStorage, InMemStorage, SqliteStorage, Storage,
+        self, serializer::Json, ErasedStorage, GetChatId, SqliteStorage, Storage,
     },
     prelude::*,
+    types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
 };
 
 type MyDialogue = Dialogue<State, ErasedStorage<State>>;
@@ -17,6 +19,8 @@ pub enum State {
     ReceiveFullName,
     ReceiveAge { full_name: String },
     ReceiveLocation { full_name: String, age: u8 },
+    ReceiveFromFiletype,
+    ReceiveToFiletype { from_filetype: String },
 }
 
 impl Default for State {
@@ -39,13 +43,21 @@ async fn main() -> Result<()> {
 
     Dispatcher::builder(
         bot,
-        Update::filter_message()
-            .enter_dialogue::<Message, ErasedStorage<State>, State>()
-            .branch(dptree::case![State::Start].endpoint(start))
-            .branch(dptree::case![State::ReceiveFullName].endpoint(receive_full_name))
-            .branch(dptree::case![State::ReceiveAge { full_name }].endpoint(receive_age))
+        dialogue::enter::<Update, ErasedStorage<State>, State, _>()
             .branch(
-                dptree::case![State::ReceiveLocation { full_name, age }].endpoint(receive_location),
+                Update::filter_message()
+                    .branch(dptree::case![State::Start].endpoint(start))
+                    .branch(dptree::case![State::ReceiveFullName].endpoint(receive_full_name)),
+            )
+            .branch(
+                Update::filter_callback_query()
+                    .branch(
+                        dptree::case![State::ReceiveFromFiletype].endpoint(receive_from_filetype),
+                    )
+                    .branch(
+                        dptree::case![State::ReceiveToFiletype { from_filetype }]
+                            .endpoint(receive_to_filetype),
+                    ),
             ),
     )
     .dependencies(dptree::deps![dialog_storage])
@@ -58,10 +70,16 @@ async fn main() -> Result<()> {
 }
 
 async fn start(bot: Bot, msg: Message, dialogue: MyDialogue) -> HandlerResult {
-    bot.send_message(msg.chat.id, "Let's start! What's your full name?")
-        .send()
-        .await?;
-    dialogue.update(State::ReceiveFullName).await?;
+    let keyboard = make_from_keyboard();
+    bot.send_message(
+        msg.chat.id,
+        "Let's start! Tell me the type of the original document.",
+    )
+    .reply_markup(keyboard)
+    .send()
+    .await?;
+
+    dialogue.update(State::ReceiveFromFiletype).await?;
     Ok(())
 }
 
@@ -87,48 +105,118 @@ async fn receive_full_name(bot: Bot, msg: Message, dialogue: MyDialogue) -> Hand
     Ok(())
 }
 
-async fn receive_age(
-    bot: Bot,
-    msg: Message,
-    dialogue: MyDialogue,
-    full_name: String, // Available from `State::ReceiveAge`.
-) -> HandlerResult {
-    match msg.text().map(|text| text.parse::<u8>()) {
-        Some(Ok(age)) => {
-            bot.send_message(msg.chat.id, "What's your location?")
-                .send()
-                .await?;
-            dialogue
-                .update(State::ReceiveLocation { full_name, age })
-                .await?;
+async fn receive_from_filetype(bot: Bot, q: CallbackQuery, dialogue: MyDialogue) -> HandlerResult {
+    let chat_id = q.chat_id().context("No chat id found")?;
+
+    let make_fail_msg = || {
+        let keyboard = make_from_keyboard();
+        bot.send_message(chat_id, "Tell me the type of the original document.")
+            .reply_markup(keyboard)
+    };
+
+    let make_success_msg = |from_filetype| {
+        let keyboard = make_to_keyboard();
+
+        let text = format!(
+            "The type of the original document is set to <code>{}</code>. \
+             What format do you want for the output?",
+            from_filetype
+        );
+        bot.send_message(chat_id, text)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(keyboard)
+    };
+
+    remove_keyboard_from(&bot, &q).await?;
+
+    if let Some(from_filetype) = q.data {
+        if FROM_FILETYPES.contains(&from_filetype.as_str()) {
+            let next_state = State::ReceiveToFiletype {
+                from_filetype: from_filetype.clone(),
+            };
+
+            make_success_msg(&from_filetype).send().await?;
+            dialogue.update(next_state).await?;
+        } else {
+            make_fail_msg().send().await?;
         }
-        _ => {
-            bot.send_message(msg.chat.id, "Send me a number.")
-                .send()
-                .await?;
-        }
+    } else {
+        make_fail_msg().send().await?;
     }
 
     Ok(())
 }
 
-async fn receive_location(
-    bot: Bot,
-    msg: Message,
-    dialogue: MyDialogue,
-    (full_name, age): (String, u8), // Available from `State::ReceiveLocation`.
-) -> HandlerResult {
-    match msg.text() {
-        Some(location) => {
-            let message = format!("Full name: {full_name}\nAge: {age}\nLocation: {location}");
-            bot.send_message(msg.chat.id, message).send().await?;
-            dialogue.exit().await?;
+async fn receive_to_filetype(bot: Bot, q: CallbackQuery, dialogue: MyDialogue) -> HandlerResult {
+    let chat_id = q.chat_id().context("No chat id found")?;
+
+    let make_fail_msg = || {
+        let keyboard = make_to_keyboard();
+
+        let text = format!("What format do you want for the output?");
+        bot.send_message(chat_id, text).reply_markup(keyboard)
+    };
+
+    let make_success_msg = |from_filetype| {
+        let text = format!(
+            "The output format is set to <code>{}</code>.",
+            from_filetype
+        );
+        bot.send_message(chat_id, text).parse_mode(ParseMode::Html)
+    };
+
+    remove_keyboard_from(&bot, &q).await?;
+
+    if let Some(to_filetype) = q.data {
+        if TO_FILETYPES.contains(&to_filetype.as_str()) {
+            let next_state = State::Start;
+
+            make_success_msg(&to_filetype).send().await?;
+            dialogue.update(next_state).await?;
+        } else {
+            make_fail_msg().send().await?;
         }
-        None => {
-            bot.send_message(msg.chat.id, "Send me plain text.")
-                .send()
-                .await?;
-        }
+    } else {
+        make_fail_msg().send().await?;
+    }
+
+    Ok(())
+}
+
+const FROM_FILETYPES: &[&str] = &["markdown", "asciidoc"];
+const TO_FILETYPES: &[&str] = &["PDF", "LaTeX"];
+
+/// Convert array of `&str` into a keyboard
+fn make_keyboard(contents: &[&str], num_per_row: usize) -> InlineKeyboardMarkup {
+    let mut keyboard: Vec<Vec<InlineKeyboardButton>> = vec![];
+    for filetypes in contents.chunks(num_per_row) {
+        let row = filetypes
+            .iter()
+            .map(|&version| InlineKeyboardButton::callback(version.to_owned(), version.to_owned()))
+            .collect();
+
+        keyboard.push(row);
+    }
+    InlineKeyboardMarkup::new(keyboard)
+}
+
+fn make_from_keyboard() -> InlineKeyboardMarkup {
+    make_keyboard(FROM_FILETYPES, 3)
+}
+
+fn make_to_keyboard() -> InlineKeyboardMarkup {
+    make_keyboard(TO_FILETYPES, 3)
+}
+
+async fn remove_keyboard_from(bot: &Bot, query: &CallbackQuery) -> Result<()> {
+    if let (Some(chat_id), Some(message)) = (&query.chat_id(), &query.message) {
+        info!("Removing keyboard from {chat_id:?}, {message:?}");
+
+        let mut req = bot.edit_message_reply_markup(*chat_id, message.id);
+        req.reply_markup = None;
+        req.send().await?;
+    } else {
+        info!("No chat_id or no message");
     }
 
     Ok(())
