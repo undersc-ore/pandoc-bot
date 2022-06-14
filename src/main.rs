@@ -5,8 +5,9 @@ use teloxide::{
     dispatching::dialogue::{
         self, serializer::Json, ErasedStorage, GetChatId, SqliteStorage, Storage,
     },
+    net::Download,
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
+    types::{File as TgFile, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
 };
 
 type MyDialogue = Dialogue<State, ErasedStorage<State>>;
@@ -17,10 +18,21 @@ type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 pub enum State {
     Start,
     ReceiveFullName,
-    ReceiveAge { full_name: String },
-    ReceiveLocation { full_name: String, age: u8 },
+    ReceiveAge {
+        full_name: String,
+    },
+    ReceiveLocation {
+        full_name: String,
+        age: u8,
+    },
     ReceiveFromFiletype,
-    ReceiveToFiletype { from_filetype: String },
+    ReceiveToFiletype {
+        from_filetype: String,
+    },
+    ReceiveInputFile {
+        from_filetype: String,
+        to_filetype: String,
+    },
 }
 
 impl Default for State {
@@ -47,7 +59,14 @@ async fn main() -> Result<()> {
             .branch(
                 Update::filter_message()
                     .branch(dptree::case![State::Start].endpoint(start))
-                    .branch(dptree::case![State::ReceiveFullName].endpoint(receive_full_name)),
+                    .branch(dptree::case![State::ReceiveFullName].endpoint(receive_full_name))
+                    .branch(
+                        dptree::case![State::ReceiveInputFile {
+                            from_filetype,
+                            to_filetype
+                        }]
+                        .endpoint(receive_input_file),
+                    ),
             )
             .branch(
                 Update::filter_callback_query()
@@ -147,7 +166,12 @@ async fn receive_from_filetype(bot: Bot, q: CallbackQuery, dialogue: MyDialogue)
     Ok(())
 }
 
-async fn receive_to_filetype(bot: Bot, q: CallbackQuery, dialogue: MyDialogue) -> HandlerResult {
+async fn receive_to_filetype(
+    bot: Bot,
+    q: CallbackQuery,
+    dialogue: MyDialogue,
+    from_filetype: String,
+) -> HandlerResult {
     let chat_id = q.chat_id().context("No chat id found")?;
 
     let make_fail_msg = || {
@@ -159,7 +183,8 @@ async fn receive_to_filetype(bot: Bot, q: CallbackQuery, dialogue: MyDialogue) -
 
     let make_success_msg = |from_filetype| {
         let text = format!(
-            "The output format is set to <code>{}</code>.",
+            "The output format is set to <code>{}</code>. \
+             Now send me the file to be converted.",
             from_filetype
         );
         bot.send_message(chat_id, text).parse_mode(ParseMode::Html)
@@ -169,13 +194,59 @@ async fn receive_to_filetype(bot: Bot, q: CallbackQuery, dialogue: MyDialogue) -
 
     if let Some(to_filetype) = q.data {
         if TO_FILETYPES.contains(&to_filetype.as_str()) {
-            let next_state = State::Start;
+            let next_state = State::ReceiveInputFile {
+                from_filetype,
+                to_filetype: to_filetype.clone(),
+            };
 
             make_success_msg(&to_filetype).send().await?;
             dialogue.update(next_state).await?;
         } else {
             make_fail_msg().send().await?;
         }
+    } else {
+        make_fail_msg().send().await?;
+    }
+
+    Ok(())
+}
+
+async fn receive_input_file(
+    bot: Bot,
+    msg: Message,
+    dialogue: MyDialogue,
+    (from_filetype, to_filetype): (String, String),
+) -> HandlerResult {
+    let make_fail_msg = || {
+        let keyboard = make_to_keyboard();
+
+        let text = format!("Send me the file to be converted.");
+        bot.send_message(msg.chat.id, text).reply_markup(keyboard)
+    };
+
+    let make_success_msg = || {
+        bot.send_message(msg.chat.id, "The conversion is being performed ...")
+            .parse_mode(ParseMode::Html)
+    };
+
+    if let Some(doc) = msg.document() {
+        info!(
+            "Received document with name {:?} and id {}",
+            doc.file_name, doc.file_id
+        );
+
+        let TgFile { file_path, .. } = bot.get_file(&doc.file_id).send().await?;
+        let mut file = tokio::fs::File::create(&doc.file_id).await?;
+
+        bot.download_file(&file_path, &mut file).await?;
+
+        info!(
+            "Downloaded document with name {:?} and id {}",
+            doc.file_name, doc.file_id
+        );
+
+        make_success_msg().send().await?;
+        dialogue.update(State::Start).await?;
     } else {
         make_fail_msg().send().await?;
     }
@@ -208,6 +279,7 @@ fn make_to_keyboard() -> InlineKeyboardMarkup {
     make_keyboard(TO_FILETYPES, 3)
 }
 
+/// Remove keyboard from `CallbackQuery`
 async fn remove_keyboard_from(bot: &Bot, query: &CallbackQuery) -> Result<()> {
     if let (Some(chat_id), Some(message)) = (&query.chat_id(), &query.message) {
         info!("Removing keyboard from {chat_id:?}, {message:?}");
