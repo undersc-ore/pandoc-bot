@@ -1,0 +1,13 @@
+name: "Build Nix flake on Ubuntu"
+
+on:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: cachix/install-nix-action@v17
+      - name: Build package
+        run: nix build .#

@@ -1,0 +1,31 @@
+[package]
+name = "pandoc-bot"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+pretty_env_logger = "0.4"
+log = "0.4"
+
+tokio = { version =  "1.8", features = [ "full" ] }
+tokio-util = { version = "0.6.0", features = [ "codec" ]}
+
+anyhow = "1.0"
+
+serde = { version = "1.0", features = [ "derive" ] }
+
+[dependencies.teloxide]
+version = "0.9.2"
+features = [
+    "rustls",
+    "macros",
+    "trace-adaptor",
+    "ctrlc_handler",
+    "sqlite-storage",
+]
+default_features = false
+
+[patch.crates-io.teloxide]
+git = "https://github.com/kotatsuyaki/teloxide.git"
+branch = "release"

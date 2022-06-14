@@ -1,0 +1,8 @@
+/target
+
+.direnv
+*.sqlite3
+*-shm
+*-wal
+
+.envrc
