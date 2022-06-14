@@ -1,3 +1,5 @@
+use std::{env, path::PathBuf};
+
 use anyhow::{Context, Result};
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -235,9 +237,21 @@ async fn receive_input_file(
             doc.file_name, doc.file_id
         );
 
+        // Not really file path on the FS, but this is how Telegram name their API
         let TgFile { file_path, .. } = bot.get_file(&doc.file_id).send().await?;
-        let mut file = tokio::fs::File::create(&doc.file_id).await?;
 
+        let input_file_path = path_for_input_file(&doc.file_id);
+
+        // Create base path for the input file
+        tokio::fs::create_dir_all(
+            input_file_path
+                .parent()
+                .context("No parent path for input_file_path")?,
+        )
+        .await?;
+
+        // Download the file
+        let mut file = tokio::fs::File::create(&doc.file_id).await?;
         bot.download_file(&file_path, &mut file).await?;
 
         info!(
@@ -292,4 +306,14 @@ async fn remove_keyboard_from(bot: &Bot, query: &CallbackQuery) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Defaults to `./inputs/<file_id>`.
+/// If the env var is defined, then `$INPUT_BASE_PATH/inputs/<file_id>`.
+fn path_for_input_file<S: AsRef<str>>(file_id: S) -> PathBuf {
+    let mut path = env::var("INPUT_BASE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or(PathBuf::from("inputs"));
+    path.push(file_id.as_ref());
+    path
 }
