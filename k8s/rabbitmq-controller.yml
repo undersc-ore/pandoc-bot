@@ -13,10 +13,8 @@ spec:
         component: rabbitmq
     spec:
       containers:
-      - image: rabbitmq
+      - image: rabbitmq:3
+        imagePullPolicy: Always
         name: rabbitmq
         ports:
         - containerPort: 5672
-        resources:
-          limits:
-            cpu: 100m
