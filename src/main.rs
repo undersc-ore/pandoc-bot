@@ -1,16 +1,20 @@
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
+use futures_lite::stream::StreamExt;
+use lapin::{options::BasicPublishOptions, BasicProperties};
 use log::info;
 use serde::{Deserialize, Serialize};
 use teloxide::{
-    dispatching::dialogue::{
-        self, serializer::Json, ErasedStorage, GetChatId, SqliteStorage, Storage,
+    dispatching::{
+        dialogue::{self, serializer::Json, ErasedStorage, GetChatId, SqliteStorage, Storage},
+        UpdateHandler,
     },
     net::Download,
     prelude::*,
-    types::{File as TgFile, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode},
+    types::{File as TgFile, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ParseMode},
 };
+use tokio::fs::File;
 
 type MyDialogue = Dialogue<State, ErasedStorage<State>>;
 type MyStorage = std::sync::Arc<ErasedStorage<State>>;
@@ -46,7 +50,22 @@ impl Default for State {
 #[tokio::main]
 async fn main() -> Result<()> {
     pretty_env_logger::init();
-    log::info!("Starting dialogue bot...");
+
+    // Connect to queue
+    let amqp_addr = env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://127.0.0.1:5672".into());
+    let amqp_conn = lapin::Connection::connect(
+        &amqp_addr,
+        lapin::ConnectionProperties::default()
+            .with_executor(tokio_executor_trait::Tokio::current())
+            .with_reactor(tokio_reactor_trait::Tokio),
+    )
+    .await?;
+    let amqp_conn = Arc::new(amqp_conn);
+
+    info!("Connected to AMQP");
+
+    // Setup bot
+    info!("Starting dialogue bot ...");
 
     let bot = Bot::from_env();
 
@@ -61,40 +80,99 @@ async fn main() -> Result<()> {
     .context("Failed to open SqliteStorage")?
     .erase();
 
-    Dispatcher::builder(
-        bot,
-        dialogue::enter::<Update, ErasedStorage<State>, State, _>()
-            .branch(
-                Update::filter_message()
-                    .branch(dptree::case![State::Start].endpoint(start))
-                    .branch(dptree::case![State::ReceiveFullName].endpoint(receive_full_name))
-                    .branch(
-                        dptree::case![State::ReceiveInputFile {
-                            from_filetype,
-                            to_filetype
-                        }]
-                        .endpoint(receive_input_file),
-                    ),
-            )
-            .branch(
-                Update::filter_callback_query()
-                    .branch(
-                        dptree::case![State::ReceiveFromFiletype].endpoint(receive_from_filetype),
-                    )
-                    .branch(
-                        dptree::case![State::ReceiveToFiletype { from_filetype }]
-                            .endpoint(receive_to_filetype),
-                    ),
-            ),
-    )
-    .dependencies(dptree::deps![storage])
-    .build()
-    .setup_ctrlc_handler()
-    .dispatch()
-    .await;
+    // Start the returning queue listener
+    let returning_queue_task = tokio::spawn(listen_returning_queue(bot.clone(), amqp_conn.clone()));
+
+    // Start the bot
+    Dispatcher::builder(bot, bot_scheme())
+        .dependencies(dptree::deps![storage, amqp_conn.clone()])
+        .build()
+        .setup_ctrlc_handler()
+        .dispatch()
+        .await;
+
+    // Gracefully shutdown returning queue task
+    amqp_conn.close(0, "").await?;
+    returning_queue_task.await??;
 
     Ok(())
 }
+
+fn bot_scheme() -> UpdateHandler<Box<dyn std::error::Error + Send + Sync>> {
+    dialogue::enter::<Update, ErasedStorage<State>, State, _>()
+        .branch(
+            Update::filter_message()
+                .branch(dptree::case![State::Start].endpoint(start))
+                .branch(
+                    dptree::case![State::ReceiveInputFile {
+                        from_filetype,
+                        to_filetype
+                    }]
+                    .endpoint(receive_input_file),
+                ),
+        )
+        .branch(
+            Update::filter_callback_query()
+                .branch(dptree::case![State::ReceiveFromFiletype].endpoint(receive_from_filetype))
+                .branch(
+                    dptree::case![State::ReceiveToFiletype { from_filetype }]
+                        .endpoint(receive_to_filetype),
+                ),
+        )
+}
+
+/// Listen on the returning queue and return the results to bot users
+async fn listen_returning_queue(bot: Bot, amqp_conn: Arc<lapin::Connection>) -> Result<()> {
+    let channel = amqp_conn.create_channel().await?;
+    let queue = channel
+        .queue_declare("pandoc-outputs", Default::default(), Default::default())
+        .await?;
+    info!("Declared queue {queue:?}");
+    let mut consumer = channel
+        .basic_consume("pandoc-outputs", "", Default::default(), Default::default())
+        .await?;
+    while let Some(delivery) = consumer.next().await {
+        let delivery = delivery?;
+        let res: ConvertResponse = bson::from_slice(&delivery.data)?;
+
+        delivery.ack(Default::default()).await?;
+
+        match res {
+            ConvertResponse::Success {
+                chat_id,
+                file,
+                to_filetype,
+            } => {
+                info!("Received successful conversion");
+
+                let document = InputFile::memory(file).file_name("output_file");
+                bot.send_document(ChatId(chat_id), document)
+                    .caption("Converted successfully!")
+                    .send()
+                    .await?;
+            }
+            ConvertResponse::Failure { chat_id, error_msg } => {
+                info!("Received failed conversion");
+
+                bot.send_message(
+                    ChatId(chat_id),
+                    format!(
+                        "Failed to perform the conversion:\n<pre>{}</pre>",
+                        error_msg
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .send()
+                .await?;
+            }
+        }
+
+        info!("Got convert response from queue");
+    }
+    Ok(())
+}
+
+/* Bot handlers */
 
 async fn start(bot: Bot, msg: Message, dialogue: MyDialogue) -> HandlerResult {
     let keyboard = make_from_keyboard();
@@ -107,28 +185,6 @@ async fn start(bot: Bot, msg: Message, dialogue: MyDialogue) -> HandlerResult {
     .await?;
 
     dialogue.update(State::ReceiveFromFiletype).await?;
-    Ok(())
-}
-
-async fn receive_full_name(bot: Bot, msg: Message, dialogue: MyDialogue) -> HandlerResult {
-    match msg.text() {
-        Some(text) => {
-            bot.send_message(msg.chat.id, "How old are you?")
-                .send()
-                .await?;
-            dialogue
-                .update(State::ReceiveAge {
-                    full_name: text.into(),
-                })
-                .await?;
-        }
-        None => {
-            bot.send_message(msg.chat.id, "Send me plain text.")
-                .send()
-                .await?;
-        }
-    }
-
     Ok(())
 }
 
@@ -219,10 +275,36 @@ async fn receive_to_filetype(
     Ok(())
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct ConvertRequest {
+    chat_id: i64,
+    #[serde(with = "serde_bytes")]
+    file: Vec<u8>,
+    file_id: String,
+    from_filetype: String,
+    to_filetype: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+enum ConvertResponse {
+    Success {
+        chat_id: i64,
+        #[serde(with = "serde_bytes")]
+        file: Vec<u8>,
+        to_filetype: String,
+    },
+    Failure {
+        chat_id: i64,
+        error_msg: String,
+    },
+}
+
 async fn receive_input_file(
     bot: Bot,
     msg: Message,
     dialogue: MyDialogue,
+    amqp_conn: Arc<lapin::Connection>,
     (from_filetype, to_filetype): (String, String),
 ) -> HandlerResult {
     let make_fail_msg = || {
@@ -243,6 +325,7 @@ async fn receive_input_file(
             doc.file_name, doc.file_id
         );
 
+        /* Download file to disk */
         // Not really file path on the FS, but this is how Telegram name their API
         let TgFile { file_path, .. } = bot.get_file(&doc.file_id).send().await?;
 
@@ -256,9 +339,10 @@ async fn receive_input_file(
         )
         .await?;
 
-        // Download the file
-        let mut file = tokio::fs::File::create(&doc.file_id).await?;
+        // Download the file and sync
+        let mut file = File::create(&input_file_path).await?;
         bot.download_file(&file_path, &mut file).await?;
+        file.sync_all().await?;
 
         info!(
             "Downloaded document with name {:?} and id {}",
@@ -267,6 +351,34 @@ async fn receive_input_file(
 
         make_success_msg().send().await?;
         dialogue.update(State::Start).await?;
+
+        /* Send to job queue */
+        let binary = tokio::fs::read(&input_file_path).await?;
+        let channel = amqp_conn.create_channel().await?;
+
+        // Create request and convert to BSON
+        let req = {
+            let req = ConvertRequest {
+                chat_id: msg.chat.id.0,
+                file: binary,
+                file_id: doc.file_id.clone(),
+                from_filetype,
+                to_filetype,
+            };
+            bson::to_vec(&req)?
+        };
+
+        // Send to queue
+        channel
+            .basic_publish(
+                "",
+                "pandoc-bot-jobs",
+                BasicPublishOptions::default(),
+                &req,
+                BasicProperties::default(),
+            )
+            .await?
+            .await?;
     } else {
         make_fail_msg().send().await?;
     }
@@ -275,7 +387,7 @@ async fn receive_input_file(
 }
 
 const FROM_FILETYPES: &[&str] = &["markdown", "asciidoc"];
-const TO_FILETYPES: &[&str] = &["PDF", "LaTeX"];
+const TO_FILETYPES: &[&str] = &["pdf", "latex"];
 
 /// Convert array of `&str` into a keyboard
 fn make_keyboard(contents: &[&str], num_per_row: usize) -> InlineKeyboardMarkup {
