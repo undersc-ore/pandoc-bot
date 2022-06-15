@@ -4,9 +4,15 @@ metadata:
   name: pandoc-bot
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      app: pandoc-bot
   strategy:
     type: Recreate
   template:
+    metadata:
+      labels:
+        app: pandoc-bot
     spec:
       volumes:
         - name: podman-bot-state
@@ -24,7 +30,16 @@ spec:
               value: /state
             -
               name: AMQP_ADDR
-              value: 'aqmp://rabbitmq-service:5672'
+              value: 'amqp://rabbitmq-service:5672'
+            -
+              name: RUST_LOG
+              value: pandoc_bot=info
+            -
+              name: TELOXIDE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pandoc-bot-token
+                  key: token
           volumeMounts:
             - name: podman-bot-state
               mountPath: /state
