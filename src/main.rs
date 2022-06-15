@@ -145,9 +145,14 @@ async fn listen_returning_queue(bot: Bot, amqp_conn: Arc<lapin::Connection>) -> 
             } => {
                 info!("Received successful conversion");
 
-                let document = InputFile::memory(file).file_name("output_file");
+                let text = format!("Converted succesffully to <b>{to_filetype}</b>!");
+
+                let output_filename = format!("output.{}", filetype_to_extension(&to_filetype));
+                let document = InputFile::memory(file).file_name(output_filename);
+
                 bot.send_document(ChatId(chat_id), document)
-                    .caption("Converted successfully!")
+                    .caption(text)
+                    .parse_mode(ParseMode::Html)
                     .send()
                     .await?;
             }
@@ -189,6 +194,7 @@ async fn start(bot: Bot, msg: Message, dialogue: MyDialogue) -> HandlerResult {
 }
 
 async fn receive_from_filetype(bot: Bot, q: CallbackQuery, dialogue: MyDialogue) -> HandlerResult {
+    bot.answer_callback_query(q.id.clone()).send().await?;
     let chat_id = q.chat_id().context("No chat id found")?;
 
     let make_fail_msg = || {
@@ -201,7 +207,7 @@ async fn receive_from_filetype(bot: Bot, q: CallbackQuery, dialogue: MyDialogue)
         let keyboard = make_to_keyboard();
 
         let text = format!(
-            "The type of the original document is set to <code>{}</code>. \
+            "The type of the original document is set to <b>{}</b>. \
              What format do you want for the output?",
             from_filetype
         );
@@ -236,6 +242,7 @@ async fn receive_to_filetype(
     dialogue: MyDialogue,
     from_filetype: String,
 ) -> HandlerResult {
+    bot.answer_callback_query(q.id.clone()).send().await?;
     let chat_id = q.chat_id().context("No chat id found")?;
 
     let make_fail_msg = || {
@@ -247,7 +254,7 @@ async fn receive_to_filetype(
 
     let make_success_msg = |from_filetype| {
         let text = format!(
-            "The output format is set to <code>{}</code>. \
+            "The output format is set to <b>{}</b>. \
              Now send me the file to be converted.",
             from_filetype
         );
@@ -386,8 +393,19 @@ async fn receive_input_file(
     Ok(())
 }
 
-const FROM_FILETYPES: &[&str] = &["markdown", "asciidoc"];
-const TO_FILETYPES: &[&str] = &["pdf", "latex"];
+const FROM_FILETYPES: &[&str] = &["markdown"];
+const TO_FILETYPES: &[&str] = &["pdf", "latex", "docx", "odt"];
+
+fn filetype_to_extension(filetype: &str) -> &'static str {
+    match filetype {
+        "markdown" => "md",
+        "pdf" => "pdf",
+        "latex" => "tex",
+        "docx" => "docx",
+        "odt" => "odt",
+        _ => "txt",
+    }
+}
 
 /// Convert array of `&str` into a keyboard
 fn make_keyboard(contents: &[&str], num_per_row: usize) -> InlineKeyboardMarkup {
