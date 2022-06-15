@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pandoc-bot
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  template:
+    spec:
+      volumes:
+        - name: podman-bot-state
+          emptyDir: {}
+      containers:
+        - name: pandoc-bot
+          image: kotatsuyaki/pandoc-bot
+          imagePullPolicy: Always
+          env:
+            -
+              name: INPUT_BASE_PATH
+              value: /inputs
+            -
+              name: STATE_PATH
+              value: /state
+            -
+              name: AMQP_ADDR
+              value: 'aqmp://rabbitmq-service:5672'
+          volumeMounts:
+            - name: podman-bot-state
+              mountPath: /state
+              subPath: ''
