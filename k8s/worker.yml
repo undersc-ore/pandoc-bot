@@ -22,3 +22,6 @@ spec:
             -
               name: AMQP_URL
               value: amqp://rabbitmq-service:5672
+            -
+              name: RUST_LOG
+              value: pandoc_bot_worker=info
